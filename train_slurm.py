@@ -249,7 +249,7 @@ def run(config):
             if writer is None:
                 import pavi
                 writer = pavi.SummaryWriter('BigGAN-Pytorch')
-                writer.add_scalars('metric', **metrics, state_dict['iter'])
+                writer.add_scalars('metric', metrics, state_dict['iter'])
 
         # Increment epoch counter at end of epoch
         state_dict['epoch'] += 1
