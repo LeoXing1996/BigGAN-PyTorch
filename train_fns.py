@@ -206,7 +206,7 @@ def test(G,
           (state_dict['itr'], IS_mean, IS_std, FID))
     # If improved over previous best metric, save approrpiate copy
     if ((config['which_best'] == 'IS' and IS_mean > state_dict['best_IS']) or
-        (config['which_best'] == 'FID' and FID < state_dict['best_FID'])):
+            (config['which_best'] == 'FID' and FID < state_dict['best_FID'])):
         print('%s improved over previous best, saving checkpoint...' %
               config['which_best'])
         utils.save_weights(G, D, state_dict, config['weights_root'],

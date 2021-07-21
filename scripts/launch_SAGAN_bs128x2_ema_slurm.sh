@@ -1,6 +1,10 @@
 #!/bin/bash
-srun -p Test -n1 --cpus-per-task=2 --gres=gpu:4\
-python train.py \
+set -x
+
+PART=${1:-Test}
+
+srun -p ${PART} -n1 --cpus-per-task=2 --gres=gpu:4
+python train_slurm.py \
 --dataset I128_hdf5 --parallel --shuffle  --num_workers 8 --batch_size 128  \
 --num_G_accumulations 2 --num_D_accumulations 2 \
 --num_D_steps 1 --G_lr 1e-4 --D_lr 4e-4 --D_B2 0.999 --G_B2 0.999 \
