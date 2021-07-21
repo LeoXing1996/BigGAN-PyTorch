@@ -248,8 +248,9 @@ def run(config):
                                test_log)
             if writer is None:
                 import pavi
-                writer = pavi.SummaryWriter('BigGAN-Pytorch')
-                writer.add_scalars('metric', metrics, state_dict['iter'])
+                writer = pavi.SummaryWriter(
+                    task='SAGAN', model='BigGAN-Pytorch',)
+                writer.add_scalars('metric', metrics, state_dict['itr'])
 
         # Increment epoch counter at end of epoch
         state_dict['epoch'] += 1
