@@ -33,6 +33,7 @@ from sync_batchnorm import patch_replication_callback
 # of this training run.
 def run(config):
 
+    writer = None
     # Update the config dict as necessary
     # This is for convenience, to add settings derived from the user-specified
     # configuration into the config-dict (e.g. inferring the number of classes
@@ -184,6 +185,7 @@ def run(config):
         config=config)
 
     print('Beginning training at epoch %d...' % state_dict['epoch'])
+
     # Train for specified number of epochs, although we mostly track G iterations.  # noqa
     for epoch in range(state_dict['epoch'], config['num_epochs']):
         # Which progressbar to use? TQDM or my own?
@@ -244,6 +246,11 @@ def run(config):
                 train_fns.test(G, D, G_ema, z_, y_, state_dict, config, sample,
                                get_inception_metrics, experiment_name,
                                test_log)
+            if writer is None:
+                import pavi
+                writer = pavi.SummaryWriter('BigGAN-Pytorch')
+                writer.add_scalars('metric', **metrics, state_dict['iter'])
+
         # Increment epoch counter at end of epoch
         state_dict['epoch'] += 1
 
