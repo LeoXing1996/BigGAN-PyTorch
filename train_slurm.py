@@ -251,6 +251,7 @@ def run(config):
                 writer = pavi.SummaryWriter(
                     task='SAGAN', model='BigGAN-Pytorch',)
                 writer.add_scalars('metric', metrics, state_dict['itr'])
+                print('ttt')
 
         # Increment epoch counter at end of epoch
         state_dict['epoch'] += 1
