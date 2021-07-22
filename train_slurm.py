@@ -10,6 +10,7 @@
 import os
 import functools
 import math
+from threading import local
 import numpy as np
 from tqdm import tqdm, trange
 
@@ -19,6 +20,8 @@ from torch.nn import init
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.nn import Parameter as P
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch import distributed as dist
 import torchvision
 
 # Import my stuff
@@ -27,13 +30,16 @@ import utils
 import losses
 import train_fns
 from sync_batchnorm import patch_replication_callback
+from dist_util import init_dist, get_dist_info
 
 
 # The main training file. Config is a dictionary specifying the configuration
 # of this training run.
 def run(config):
 
-    writer = None
+    local_rank, world_size = get_dist_info()
+    gpu_ids = range(world_size)
+
     # Update the config dict as necessary
     # This is for convenience, to add settings derived from the user-specified
     # configuration into the config-dict (e.g. inferring the number of classes
@@ -48,7 +54,6 @@ def run(config):
         print('Skipping initialization for training resumption...')
         config['skip_init'] = True
     config = utils.update_config_roots(config)
-    device = 'cuda'
 
     # Seed RNG
     utils.seed_rng(config['seed'])
@@ -66,8 +71,8 @@ def run(config):
     print('Experiment name is %s' % experiment_name)
 
     # Next, build the model
-    G = model.Generator(**config).to(device)
-    D = model.Discriminator(**config).to(device)
+    G = model.Generator(**config).cuda()
+    D = model.Discriminator(**config).cuda()
 
     # If using EMA, prepare it
     if config['ema']:
@@ -76,7 +81,7 @@ def run(config):
         G_ema = model.Generator(**{
             **config, 'skip_init': True,
             'no_optim': True
-        }).to(device)
+        }).cuda()
         ema = utils.ema(G, G_ema, config['ema_decay'], config['ema_start'])
     else:
         G_ema, ema = None, None
@@ -92,12 +97,12 @@ def run(config):
         D = D.half()
         # Consider automatically reducing SN_eps?
     GD = model.G_D(G, D)
-    print(G)
-    print(D)
-    print('Number of params in G: {} D: {}'.format(
-        *
-        [sum([p.data.nelement() for p in net.parameters()])
-         for net in [G, D]]))
+    # print(G)
+    # print(D)
+    # print('Number of params in G: {} D: {}'.format(
+    #     *
+    #     [sum([p.data.nelement() for p in net.parameters()])
+    #      for net in [G, D]]))
     # Prepare state dict, which holds things like epoch # and itr #
     state_dict = {
         'itr': 0,
@@ -119,7 +124,9 @@ def run(config):
 
     # If parallel, parallelize the GD module
     if config['parallel']:
-        GD = nn.DataParallel(GD)
+        # GD = nn.DataParallel(GD)
+        GD = DDP(GD)
+        # TODO: this function is not called by SAGAN --> ignore this
         if config['cross_replica']:
             patch_replication_callback(GD)
 
@@ -143,10 +150,11 @@ def run(config):
     # Note that at every loader iteration we pass in enough data to complete
     # a full D iteration (regardless of number of D steps and accumulations)
     D_batch_size = (config['batch_size'] * config['num_D_steps'] *
-                    config['num_D_accumulations'])
+                    config['num_D_accumulations']) // world_size
     loaders = utils.get_data_loaders(**{
         **config, 'batch_size': D_batch_size,
-        'start_itr': state_dict['itr']
+        'start_itr': state_dict['itr'],
+        'use_DDP_sampler': True
     })
 
     # Prepare inception metrics: FID and IS
@@ -155,17 +163,18 @@ def run(config):
 
     # Prepare noise and randomly sampled label arrays
     # Allow for different batch sizes in G
-    G_batch_size = max(config['G_batch_size'], config['batch_size'])
+    G_batch_size = max(
+        config['G_batch_size'], config['batch_size']) // world_size
     z_, y_ = utils.prepare_z_y(G_batch_size,
                                G.dim_z,
                                config['n_classes'],
-                               device=device,
+                               device=None,
                                fp16=config['G_fp16'])
     # Prepare a fixed z & y to see individual sample evolution throghout training  # noqa
     fixed_z, fixed_y = utils.prepare_z_y(G_batch_size,
                                          G.dim_z,
                                          config['n_classes'],
-                                         device=device,
+                                         device=None,
                                          fp16=config['G_fp16'])
     fixed_z.sample_()
     fixed_y.sample_()
@@ -186,9 +195,16 @@ def run(config):
 
     print('Beginning training at epoch %d...' % state_dict['epoch'])
 
+    if local_rank == 0:
+        import pavi
+        writer = pavi.SummaryWriter(task='SAGAN', project='BigGAN-Pytorch',)
+    else:
+        writer = None
+
     # Train for specified number of epochs, although we mostly track G iterations.  # noqa
     for epoch in range(state_dict['epoch'], config['num_epochs']):
         # Which progressbar to use? TQDM or my own?
+        loaders[0].sampler.set_epoch(epoch)
         if config['pbar'] == 'mine':
             pbar = utils.progress(loaders[0],
                                   displaytype='s1k' if
@@ -205,15 +221,16 @@ def run(config):
             if config['ema']:
                 G_ema.train()
             if config['D_fp16']:
-                x, y = x.to(device).half(), y.to(device)
+                x, y = x.cuda().half(), y.cuda()
             else:
-                x, y = x.to(device), y.to(device)
+                x, y = x.cuda(), y.cuda()
             metrics = train(x, y)
             train_log.log(itr=int(state_dict['itr']), **metrics)
 
             # Every sv_log_interval, log singular values
-            if (config['sv_log_interval'] > 0) and (
-                    not (state_dict['itr'] % config['sv_log_interval'])):
+            if (config['sv_log_interval'] > 0) and \
+                    (not (state_dict['itr'] % config['sv_log_interval'])) \
+                    and local_rank == 0:
                 train_log.log(itr=int(state_dict['itr']),
                               **{
                                   **utils.get_SVs(G, 'G'),
@@ -221,14 +238,15 @@ def run(config):
                               })
 
             # If using my progbar, print metrics.
-            if config['pbar'] == 'mine':
+            if config['pbar'] == 'mine' and local_rank == 0:
                 print(', '.join(
                     ['itr: %d' % state_dict['itr']] +
                     ['%s : %+4.3f' % (key, metrics[key]) for key in metrics]),
                       end=' ')
 
             # Save weights and copies as configured at specified interval
-            if not (state_dict['itr'] % config['save_every']):
+            if not (state_dict['itr'] % config['save_every']) \
+                    and local_rank == 0:
                 if config['G_eval_mode']:
                     print('Switchin G to eval mode...')
                     G.eval()
@@ -239,18 +257,18 @@ def run(config):
                                           experiment_name)
 
             # Test every specified interval
-            if not (state_dict['itr'] % config['test_every']):
+            if not (state_dict['itr'] % config['test_every']) \
+                    and local_rank == 0:
                 if config['G_eval_mode']:
                     print('Switchin G to eval mode...')
                     G.eval()
                 train_fns.test(G, D, G_ema, z_, y_, state_dict, config, sample,
                                get_inception_metrics, experiment_name,
                                test_log)
-            if writer is None:
-                import pavi
-                writer = pavi.SummaryWriter(
-                    task='SAGAN', model='BigGAN-Pytorch',)
-                writer.add_scalars('metric', metrics, state_dict['itr'])
+                dist.barrier()
+
+            if writer is not None:
+                writer.add_scalars('loss', metrics, state_dict['itr'])
 
         # Increment epoch counter at end of epoch
         state_dict['epoch'] += 1
@@ -265,4 +283,6 @@ def main():
 
 
 if __name__ == '__main__':
+    init_dist('slurm', port=98768)
+    # re-set gpu_ids with distributed training mode
     main()

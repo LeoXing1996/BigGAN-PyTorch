@@ -23,6 +23,7 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 import datasets as dset
 
@@ -762,6 +763,7 @@ def get_data_loaders(dataset,
                      start_itr=0,
                      num_epochs=500,
                      use_multiepoch_sampler=False,
+                     use_DDP_sampler=False,
                      **kwargs):
 
     # Append /FILENAME.hdf5 to root if using hdf5
@@ -820,6 +822,14 @@ def get_data_loaders(dataset,
         loader_kwargs = {'num_workers': num_workers, 'pin_memory': pin_memory}
         sampler = MultiEpochSampler(train_set, num_epochs, start_itr,
                                     batch_size)
+        train_loader = DataLoader(train_set,
+                                  batch_size=batch_size,
+                                  sampler=sampler,
+                                  **loader_kwargs)
+    elif use_DDP_sampler:
+        loader_kwargs = {'num_workers': num_workers,
+                         'pin_memory': pin_memory, 'shuffle': False}
+        sampler = DistributedSampler(train_set)
         train_loader = DataLoader(train_set,
                                   batch_size=batch_size,
                                   sampler=sampler,
@@ -1060,9 +1070,13 @@ class MyLogger(object):
         self.reinitialize = reinitialize
         self.metrics = []
         self.logstyle = logstyle  # One of '%3.3f' or like '%3.3e'
+        from dist_util import get_dist_info
+        self.rank, _ = get_dist_info()
 
     # Delete log if re-starting and log already exists
     def reinit(self, item):
+        if self.rank != 0:
+            return
         if os.path.exists('%s/%s.log' % (self.root, item)):
             if self.reinitialize:
                 # Only print the removal mess
@@ -1076,6 +1090,8 @@ class MyLogger(object):
 
     # Log in plaintext; this is designed for being read in MATLAB(sorry not sorry)
     def log(self, itr, **kwargs):
+        if self.rank != 0:
+            return
         for arg in kwargs:
             if arg not in self.metrics:
                 if self.reinitialize:
@@ -1423,7 +1439,10 @@ def prepare_z_y(G_batch_size,
                 z_var=1.0):
     z_ = Distribution(torch.randn(G_batch_size, dim_z, requires_grad=False))
     z_.init_distribution('normal', mean=0, var=z_var)
-    z_ = z_.to(device, torch.float16 if fp16 else torch.float32)
+    if not device:
+        z_ = z_.cuda(torch.float16 if fp16 else torch.float32)
+    else:
+        z_ = z_.to(device, torch.float16 if fp16 else torch.float32)
 
     if fp16:
         z_ = z_.half()
